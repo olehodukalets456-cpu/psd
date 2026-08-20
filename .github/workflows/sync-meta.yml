@@ -1,0 +1,38 @@
+name: Sync Meta to Google Sheets
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "5 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      META_AD_ACCOUNT_ID: act_369275069245313
+      GOOGLE_SHEET_ID: 1yJQsmaNUpyaRxr_jR9pSwotlh0HjOGzfZYPOR9QEEc0
+      META_API_VERSION: v21.0
+      START_DATE: "2026-01-01"
+      RAW_SHEET_NAME: raw_meta
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync Meta data to Google Sheets
+        run: python sync_meta_to_sheets.py
