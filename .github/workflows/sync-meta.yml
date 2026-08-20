@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   sync:
@@ -14,7 +15,6 @@ jobs:
     timeout-minutes: 15
     env:
       META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
-      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       META_AD_ACCOUNT_ID: act_369275069245313
       GOOGLE_SHEET_ID: 1yJQsmaNUpyaRxr_jR9pSwotlh0HjOGzfZYPOR9QEEc0
       META_API_VERSION: v21.0
@@ -24,6 +24,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/57835323297/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: psd-sheets-sync@psd-info-506112.iam.gserviceaccount.com
 
       - name: Set up Python
         uses: actions/setup-python@v5
