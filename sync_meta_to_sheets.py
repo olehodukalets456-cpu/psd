@@ -34,6 +34,7 @@ META_FIELDS = ",".join(
 )
 
 SHEETS_SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
+GOOGLE_SHEETS_EPOCH = date(1899, 12, 30)
 
 
 def required_env(name: str) -> str:
@@ -137,12 +138,19 @@ def fetch_meta_insights(access_token: str) -> list[dict[str, Any]]:
     return rows
 
 
+def google_date_serial(iso_date: str) -> int:
+    try:
+        parsed = date.fromisoformat(iso_date)
+    except ValueError:
+        raise RuntimeError(f"Meta returned an invalid date_start: {iso_date}") from None
+    return (parsed - GOOGLE_SHEETS_EPOCH).days
+
+
 def transform_rows(meta_rows: list[dict[str, Any]]) -> list[list[Any]]:
     output: list[list[Any]] = []
 
     for item in meta_rows:
         spend = to_float(item.get("spend"))
-
         if spend <= 0:
             continue
 
@@ -164,13 +172,13 @@ def transform_rows(meta_rows: list[dict[str, Any]]) -> list[list[Any]]:
         else:
             campaign_type = "other"
 
-        date_start = item.get("date_start")
+        date_start = str(item.get("date_start") or "")
         if not date_start:
             raise RuntimeError("Meta returned a row without date_start; refusing to overwrite the sheet.")
 
         output.append(
             [
-                str(date_start),
+                google_date_serial(date_start),
                 campaign_name,
                 spend,
                 impressions,
@@ -197,12 +205,55 @@ def build_sheets_service():
     return build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
 
+def get_raw_sheet_id(service) -> int:
+    metadata = service.spreadsheets().get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        fields="sheets(properties(sheetId,title))",
+    ).execute()
+    for sheet in metadata.get("sheets", []):
+        properties = sheet.get("properties", {})
+        if properties.get("title") == RAW_SHEET_NAME:
+            return int(properties["sheetId"])
+    raise RuntimeError(f"Google Sheet tab '{RAW_SHEET_NAME}' was not found.")
+
+
+def apply_date_format(service, raw_sheet_id: int, row_count: int) -> None:
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        body={
+            "requests": [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": raw_sheet_id,
+                            "startRowIndex": 2,
+                            "endRowIndex": 2 + row_count,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 1,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {
+                                    "type": "DATE",
+                                    "pattern": "yyyy-mm-dd",
+                                }
+                            }
+                        },
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                }
+            ]
+        },
+    ).execute()
+
+
 def replace_raw_meta(service, rows: list[list[Any]]) -> None:
     if not rows:
         raise RuntimeError(
             "Meta returned zero rows with spend > 0. The existing sheet was NOT cleared."
         )
 
+    raw_sheet_id = get_raw_sheet_id(service)
     values_api = service.spreadsheets().values()
 
     # Clear only after Meta data has been fully fetched and transformed.
@@ -221,6 +272,10 @@ def replace_raw_meta(service, rows: list[list[Any]]) -> None:
             valueInputOption="RAW",
             body={"majorDimension": "ROWS", "values": chunk},
         ).execute()
+
+    # Column A must contain real spreadsheet dates, not text. This keeps all
+    # existing SUMIFS date filters and dashboard formulas working.
+    apply_date_format(service, raw_sheet_id, len(rows))
 
 
 def main() -> int:
@@ -247,7 +302,7 @@ def main() -> int:
 
     print(
         f"Google Sheet updated successfully: {GOOGLE_SHEET_ID} / {RAW_SHEET_NAME}, "
-        f"{len(transformed)} rows written with RAW value input."
+        f"{len(transformed)} rows written; column A stored as real dates."
     )
     return 0
 
