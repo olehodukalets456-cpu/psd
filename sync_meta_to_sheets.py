@@ -4,8 +4,8 @@ import sys
 from datetime import date
 from typing import Any
 
+import google.auth
 import requests
-from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 
@@ -143,7 +143,6 @@ def transform_rows(meta_rows: list[dict[str, Any]]) -> list[list[Any]]:
     for item in meta_rows:
         spend = to_float(item.get("spend"))
 
-        # Preserve the Make filter exactly: only rows with spend > 0 reach raw_meta.
         if spend <= 0:
             continue
 
@@ -189,16 +188,11 @@ def transform_rows(meta_rows: list[dict[str, Any]]) -> list[list[Any]]:
     return output
 
 
-def build_sheets_service(service_account_json: str):
+def build_sheets_service():
     try:
-        info = json.loads(service_account_json)
-    except json.JSONDecodeError:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.") from None
-
-    try:
-        credentials = Credentials.from_service_account_info(info, scopes=SHEETS_SCOPE)
-    except Exception:
-        raise RuntimeError("Could not load Google service account credentials.") from None
+        credentials, _ = google.auth.default(scopes=SHEETS_SCOPE)
+    except Exception as exc:
+        raise RuntimeError(f"Could not load Google ADC credentials: {exc}") from None
 
     return build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
@@ -231,7 +225,6 @@ def replace_raw_meta(service, rows: list[list[Any]]) -> None:
 
 def main() -> int:
     meta_access_token = required_env("META_ACCESS_TOKEN")
-    google_service_account_json = required_env("GOOGLE_SERVICE_ACCOUNT_JSON")
 
     print(
         f"Fetching Meta Insights: {META_AD_ACCOUNT_ID}, "
@@ -249,7 +242,7 @@ def main() -> int:
         f"{len(transformed)} rows after spend > 0 filter."
     )
 
-    service = build_sheets_service(google_service_account_json)
+    service = build_sheets_service()
     replace_raw_meta(service, transformed)
 
     print(
