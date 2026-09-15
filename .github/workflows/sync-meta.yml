@@ -2,6 +2,11 @@ name: Sync Meta to Google Sheets
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/sync-meta.yml"
   schedule:
     - cron: "5 6 * * *"
 
