@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
 import google.auth
@@ -19,6 +20,9 @@ START_DATE = os.getenv("START_DATE", "2026-01-01")
 META_PAGE_LIMIT = int(os.getenv("META_PAGE_LIMIT", "250"))
 META_CHUNK_DAYS = int(os.getenv("META_CHUNK_DAYS", "14"))
 WRITE_CHUNK_SIZE = int(os.getenv("WRITE_CHUNK_SIZE", "5000"))
+HISTORY_BACKUP_FILE = os.getenv(
+    "HISTORY_BACKUP_FILE", "history_before_2026-07-01.json"
+)
 
 META_FIELDS = ",".join(
     [
@@ -35,6 +39,7 @@ META_FIELDS = ",".join(
 
 SHEETS_SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
 GOOGLE_SHEETS_EPOCH = date(1899, 12, 30)
+RAW_COLUMN_COUNT = 11
 
 
 def required_env(name: str) -> str:
@@ -202,7 +207,7 @@ def google_date_serial(iso_date: str) -> int:
     try:
         parsed = date.fromisoformat(iso_date)
     except ValueError:
-        raise RuntimeError(f"Meta returned an invalid date_start: {iso_date}") from None
+        raise RuntimeError(f"Invalid ISO date: {iso_date}") from None
     return (parsed - GOOGLE_SHEETS_EPOCH).days
 
 
@@ -277,7 +282,87 @@ def get_raw_sheet_id(service) -> int:
     raise RuntimeError(f"Google Sheet tab '{RAW_SHEET_NAME}' was not found.")
 
 
+def normalize_raw_row(row: list[Any]) -> list[Any]:
+    normalized = list(row[:RAW_COLUMN_COUNT])
+    if len(normalized) < RAW_COLUMN_COUNT:
+        normalized.extend([None] * (RAW_COLUMN_COUNT - len(normalized)))
+    return normalized
+
+
+def cell_date_serial(value: Any) -> int | None:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            return google_date_serial(text[:10])
+        except RuntimeError:
+            return None
+    return None
+
+
+def read_existing_history(service) -> list[list[Any]]:
+    cutoff_serial = google_date_serial(START_DATE)
+    response = service.spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"'{RAW_SHEET_NAME}'!A3:K",
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+
+    history: list[list[Any]] = []
+    for row in response.get("values", []):
+        normalized = normalize_raw_row(row)
+        serial = cell_date_serial(normalized[0])
+        if serial is not None and serial < cutoff_serial:
+            history.append(normalized)
+
+    history.sort(key=lambda row: (cell_date_serial(row[0]) or 0, str(row[1] or "")))
+    return history
+
+
+def load_history_backup() -> list[list[Any]]:
+    path = Path(HISTORY_BACKUP_FILE)
+    if not path.exists():
+        return []
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Could not read history backup {path}: {exc}") from None
+
+    if not isinstance(payload, dict) or payload.get("cutoff") != START_DATE:
+        return []
+
+    rows = payload.get("rows", [])
+    if not isinstance(rows, list):
+        raise RuntimeError(f"History backup {path} has invalid rows format.")
+
+    normalized_rows = [normalize_raw_row(row) for row in rows if isinstance(row, list)]
+    normalized_rows.sort(key=lambda row: (cell_date_serial(row[0]) or 0, str(row[1] or "")))
+    return normalized_rows
+
+
+def choose_history_rows(service) -> tuple[list[list[Any]], str]:
+    existing = read_existing_history(service)
+    backup = load_history_backup()
+
+    # If the earlier buggy workflow already wiped Jan-Jun, restore them from
+    # the known-good workbook backup committed to the repo. Otherwise preserve
+    # whatever is already in the Google Sheet.
+    if backup and len(existing) < len(backup):
+        print(
+            f"Historical rows before {START_DATE} are incomplete in Google Sheets "
+            f"({len(existing)} found, {len(backup)} in backup). Restoring from backup."
+        )
+        return backup, "backup"
+
+    print(f"Preserving {len(existing)} existing rows before {START_DATE}.")
+    return existing, "sheet"
+
+
 def apply_date_format(service, raw_sheet_id: int, row_count: int) -> None:
+    if row_count <= 0:
+        return
     service.spreadsheets().batchUpdate(
         spreadsheetId=GOOGLE_SHEET_ID,
         body={
@@ -307,35 +392,50 @@ def apply_date_format(service, raw_sheet_id: int, row_count: int) -> None:
     ).execute()
 
 
-def replace_raw_meta(service, rows: list[list[Any]]) -> None:
-    if not rows:
-        raise RuntimeError(
-            "Meta returned zero rows with spend > 0. The existing sheet was NOT cleared."
-        )
-
-    raw_sheet_id = get_raw_sheet_id(service)
-    values_api = service.spreadsheets().values()
-
-    # Clear only after ALL Meta chunks have been fetched and transformed successfully.
-    values_api.clear(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"'{RAW_SHEET_NAME}'!A3:K",
-        body={},
-    ).execute()
-
+def write_rows(values_api, rows: list[list[Any]], start_row: int) -> None:
     for offset in range(0, len(rows), WRITE_CHUNK_SIZE):
         chunk = rows[offset : offset + WRITE_CHUNK_SIZE]
-        start_row = 3 + offset
         values_api.update(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"'{RAW_SHEET_NAME}'!A{start_row}",
+            range=f"'{RAW_SHEET_NAME}'!A{start_row + offset}",
             valueInputOption="RAW",
             body={"majorDimension": "ROWS", "values": chunk},
         ).execute()
 
-    # Column A must contain real spreadsheet dates, not text. This keeps all
-    # existing SUMIFS date filters and dashboard formulas working.
-    apply_date_format(service, raw_sheet_id, len(rows))
+
+def replace_refresh_window(service, fresh_rows: list[list[Any]]) -> tuple[int, int]:
+    if not fresh_rows:
+        raise RuntimeError(
+            "Meta returned zero rows with spend > 0. Existing Google Sheet was NOT changed."
+        )
+
+    raw_sheet_id = get_raw_sheet_id(service)
+    values_api = service.spreadsheets().values()
+    history_rows, history_source = choose_history_rows(service)
+    history_count = len(history_rows)
+    fresh_start_row = 3 + history_count
+
+    # Ensure the historical block is present and contiguous. This also restores
+    # Jan-Jun once if the previous workflow already erased it.
+    if history_rows:
+        write_rows(values_api, history_rows, 3)
+
+    # Clear ONLY the refresh window. Rows before START_DATE are never cleared.
+    values_api.clear(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"'{RAW_SHEET_NAME}'!A{fresh_start_row}:K",
+        body={},
+    ).execute()
+
+    write_rows(values_api, fresh_rows, fresh_start_row)
+    total_rows = history_count + len(fresh_rows)
+    apply_date_format(service, raw_sheet_id, total_rows)
+
+    print(
+        f"raw_meta sync complete: preserved {history_count} historical rows "
+        f"from {history_source}; refreshed {len(fresh_rows)} rows from {START_DATE} onward."
+    )
+    return history_count, len(fresh_rows)
 
 
 def main() -> int:
@@ -358,11 +458,11 @@ def main() -> int:
     )
 
     service = build_sheets_service()
-    replace_raw_meta(service, transformed)
+    history_count, fresh_count = replace_refresh_window(service, transformed)
 
     print(
-        f"Google Sheet updated successfully: {GOOGLE_SHEET_ID} / {RAW_SHEET_NAME}, "
-        f"{len(transformed)} rows written; column A stored as real dates."
+        f"Google Sheet updated successfully: {GOOGLE_SHEET_ID} / {RAW_SHEET_NAME}. "
+        f"History kept/restored: {history_count}; refreshed: {fresh_count}."
     )
     return 0
 
