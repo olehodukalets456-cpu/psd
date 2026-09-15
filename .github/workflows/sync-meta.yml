@@ -18,7 +18,7 @@ jobs:
       META_AD_ACCOUNT_ID: act_369275069245313
       GOOGLE_SHEET_ID: 1yJQsmaNUpyaRxr_jR9pSwotlh0HjOGzfZYPOR9QEEc0
       META_API_VERSION: v21.0
-      START_DATE: "2026-01-01"
+      START_DATE: "2026-07-01"
       RAW_SHEET_NAME: raw_meta
 
     steps:
