@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import google.auth
@@ -16,7 +16,8 @@ GOOGLE_SHEET_ID = os.getenv(
 )
 RAW_SHEET_NAME = os.getenv("RAW_SHEET_NAME", "raw_meta")
 START_DATE = os.getenv("START_DATE", "2026-01-01")
-META_PAGE_LIMIT = int(os.getenv("META_PAGE_LIMIT", "500"))
+META_PAGE_LIMIT = int(os.getenv("META_PAGE_LIMIT", "250"))
+META_CHUNK_DAYS = int(os.getenv("META_CHUNK_DAYS", "14"))
 WRITE_CHUNK_SIZE = int(os.getenv("WRITE_CHUNK_SIZE", "5000"))
 
 META_FIELDS = ",".join(
@@ -29,7 +30,6 @@ META_FIELDS = ",".join(
         "inline_link_clicks",
         "actions",
         "action_values",
-        "website_purchase_roas",
     ]
 )
 
@@ -62,29 +62,41 @@ def action_value(items: Any, action_type: str) -> float:
     return 0.0
 
 
-def meta_error_message(payload: Any, status_code: int) -> str:
+def meta_error_details(payload: Any, status_code: int) -> tuple[str, int | None, int | None]:
+    message = f"Meta API HTTP {status_code}"
+    code = None
+    subcode = None
     if isinstance(payload, dict):
         error = payload.get("error")
         if isinstance(error, dict):
-            message = error.get("message", "Unknown Meta API error")
+            message = str(error.get("message", message))
             code = error.get("code")
             subcode = error.get("error_subcode")
-            details = f"Meta API HTTP {status_code}: {message}"
-            if code is not None:
-                details += f" (code {code}"
-                if subcode is not None:
-                    details += f", subcode {subcode}"
-                details += ")"
-            return details
-    return f"Meta API HTTP {status_code}"
+    return message, code, subcode
 
 
-def fetch_meta_insights(access_token: str) -> list[dict[str, Any]]:
+def meta_error_message(payload: Any, status_code: int) -> str:
+    message, code, subcode = meta_error_details(payload, status_code)
+    details = f"Meta API HTTP {status_code}: {message}"
+    if code is not None:
+        details += f" (code {code}"
+        if subcode is not None:
+            details += f", subcode {subcode}"
+        details += ")"
+    return details
+
+
+def request_meta_range(
+    session: requests.Session,
+    access_token: str,
+    since: date,
+    until: date,
+) -> list[dict[str, Any]]:
     url = f"https://graph.facebook.com/{META_API_VERSION}/{META_AD_ACCOUNT_ID}/insights"
     params = {
         "access_token": access_token,
         "level": "campaign",
-        "time_range": json.dumps({"since": START_DATE, "until": date.today().isoformat()}),
+        "time_range": json.dumps({"since": since.isoformat(), "until": until.isoformat()}),
         "time_increment": "1",
         "fields": META_FIELDS,
         "action_attribution_windows": json.dumps(["7d_click", "1d_view"]),
@@ -92,7 +104,6 @@ def fetch_meta_insights(access_token: str) -> list[dict[str, Any]]:
     }
 
     rows: list[dict[str, Any]] = []
-    session = requests.Session()
     next_url: str | None = url
     first_request = True
     seen_next_urls: set[str] = set()
@@ -105,21 +116,41 @@ def fetch_meta_insights(access_token: str) -> list[dict[str, Any]]:
 
         try:
             if first_request:
-                response = session.get(next_url, params=params, timeout=60)
+                response = session.get(next_url, params=params, timeout=90)
                 first_request = False
             else:
-                response = session.get(next_url, timeout=60)
+                response = session.get(next_url, timeout=90)
         except requests.RequestException:
-            raise RuntimeError("Meta API request failed due to a network error.") from None
+            raise RuntimeError(
+                f"Meta API network error for {since.isoformat()} -> {until.isoformat()}."
+            ) from None
 
         try:
             payload = response.json()
         except ValueError:
             raise RuntimeError(
-                f"Meta API returned a non-JSON response (HTTP {response.status_code})."
+                f"Meta API returned non-JSON (HTTP {response.status_code}) for "
+                f"{since.isoformat()} -> {until.isoformat()}."
             ) from None
 
         if response.status_code >= 400 or (isinstance(payload, dict) and payload.get("error")):
+            message, code, _ = meta_error_details(payload, response.status_code)
+
+            # Meta commonly returns HTTP 500 / code 1 when the Insights request is too large.
+            # Split the date window recursively until the request becomes small enough.
+            if (response.status_code >= 500 or code in {1, 2, 4, 17, 32, 613}) and since < until:
+                days = (until - since).days
+                midpoint = since + timedelta(days=days // 2)
+                left_until = midpoint
+                right_since = midpoint + timedelta(days=1)
+                print(
+                    f"Meta rejected range {since.isoformat()} -> {until.isoformat()} "
+                    f"({message}). Splitting into smaller ranges..."
+                )
+                left_rows = request_meta_range(session, access_token, since, left_until)
+                right_rows = request_meta_range(session, access_token, right_since, until)
+                return left_rows + right_rows
+
             raise RuntimeError(meta_error_message(payload, response.status_code))
 
         page_rows = payload.get("data", []) if isinstance(payload, dict) else []
@@ -134,6 +165,35 @@ def fetch_meta_insights(access_token: str) -> list[dict[str, Any]]:
                 raise RuntimeError("Meta API pagination loop detected; refusing to overwrite the sheet.")
             seen_next_urls.add(candidate)
         next_url = candidate
+
+    return rows
+
+
+def fetch_meta_insights(access_token: str) -> list[dict[str, Any]]:
+    try:
+        start = date.fromisoformat(START_DATE)
+    except ValueError:
+        raise RuntimeError(f"Invalid START_DATE: {START_DATE}") from None
+
+    end = date.today()
+    if start > end:
+        raise RuntimeError(f"START_DATE {START_DATE} is after today {end.isoformat()}.")
+
+    rows: list[dict[str, Any]] = []
+    session = requests.Session()
+    chunk_start = start
+    chunk_number = 0
+
+    while chunk_start <= end:
+        chunk_number += 1
+        chunk_end = min(chunk_start + timedelta(days=META_CHUNK_DAYS - 1), end)
+        print(
+            f"Meta chunk {chunk_number}: {chunk_start.isoformat()} -> {chunk_end.isoformat()}"
+        )
+        chunk_rows = request_meta_range(session, access_token, chunk_start, chunk_end)
+        print(f"Meta chunk {chunk_number}: {len(chunk_rows)} rows")
+        rows.extend(chunk_rows)
+        chunk_start = chunk_end + timedelta(days=1)
 
     return rows
 
@@ -256,7 +316,7 @@ def replace_raw_meta(service, rows: list[list[Any]]) -> None:
     raw_sheet_id = get_raw_sheet_id(service)
     values_api = service.spreadsheets().values()
 
-    # Clear only after Meta data has been fully fetched and transformed.
+    # Clear only after ALL Meta chunks have been fetched and transformed successfully.
     values_api.clear(
         spreadsheetId=GOOGLE_SHEET_ID,
         range=f"'{RAW_SHEET_NAME}'!A3:K",
@@ -282,7 +342,7 @@ def main() -> int:
     meta_access_token = required_env("META_ACCESS_TOKEN")
 
     print(
-        f"Fetching Meta Insights: {META_AD_ACCOUNT_ID}, "
+        f"Fetching Meta Insights in {META_CHUNK_DAYS}-day chunks: {META_AD_ACCOUNT_ID}, "
         f"{START_DATE} -> {date.today().isoformat()}, API {META_API_VERSION}"
     )
 
